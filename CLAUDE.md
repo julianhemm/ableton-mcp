@@ -30,5 +30,7 @@ Fork version `1.4.5+jh.N`, Remote Script version `1.7.1-jh.N` (must equal `EXPEC
 ## Registration (user scope)
 
 `claude mcp add ableton -s user -e ABLETON_MCP_DISABLE_TELEMETRY=true -e ABLETON_MCP_DISABLE_DATASET=true --
-uv --directory D:/dev/ableton-mcp run --frozen ableton-mcp` - runs the working copy, so a server change needs only
-an MCP reconnect.
+uv --directory D:/dev/ableton-mcp run --frozen --no-sync ableton-mcp` - runs the working copy (editable install),
+so a server change needs only an MCP reconnect. `--no-sync` matters: without it `uv run` reinstalls the package
+after a version bump and fails while another session's server holds `.venv/Scripts/ableton-mcp.exe`. After a
+version or dependency change run `uv sync --frozen` once with every Claude session closed.
