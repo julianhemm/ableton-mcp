@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.7.1-jh.1"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -57,7 +57,18 @@ SCRIPT_CAPABILITIES = [
     "create_locator",
     "delete_clip",
     "clear_notes_from_clip",
+    "listen_prepare",
+    "listen_record_start",
+    "listen_status",
+    "listen_record_stop",
+    "listen_finish",
+    "listen_abort",
 ]
+
+# listen: the appended audio track that records by resampling
+LISTEN_TRACK_NAME = "LISTEN"
+MONITORING_OFF = 2  # Track.current_monitoring_state: 0 In, 1 Auto, 2 Off
+QUANTIZATION_ONE_BAR = 4  # Song.clip_trigger_quantization: 0 None, 1 8 Bars, ..., 4 1 Bar
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -300,7 +311,9 @@ class AbletonMCP(ControlSurface):
                                  "switch_to_arrangement_view", "set_current_song_time",
                                  "duplicate_session_clip_to_arrangement",
                                  "map_rack_magnitude", "inspect_rack",
-                                 "create_locator"]:
+                                 "create_locator",
+                                 "listen_prepare", "listen_record_start", "listen_record_stop",
+                                 "listen_finish", "listen_abort"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -400,6 +413,22 @@ class AbletonMCP(ControlSurface):
                             name = params.get("name", "")
                             time_val = params.get("time", 0.0)
                             result = self._create_locator(name, time_val)
+                        elif command_type == "listen_prepare":
+                            result = self._listen_prepare(params.get("source", "master"))
+                        elif command_type == "listen_record_start":
+                            result = self._listen_record_start(
+                                params["track_index"], params["slot_index"])
+                        elif command_type == "listen_record_stop":
+                            result = self._listen_record_stop(
+                                params["track_index"], params["slot_index"])
+                        elif command_type == "listen_finish":
+                            result = self._listen_finish(
+                                params["track_index"], params["slot_index"],
+                                params.get("previous_quantization"))
+                        elif command_type == "listen_abort":
+                            result = self._listen_abort(
+                                params["track_index"], params["slot_index"],
+                                params.get("previous_quantization"))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -467,6 +496,9 @@ class AbletonMCP(ControlSurface):
                     include_notes=include_notes,
                     include_params=include_params,
                 )
+            elif command_type == "listen_status":
+                response["result"] = self._listen_status(
+                    params["track_index"], params["slot_index"])
             elif command_type == "drain_passive_events":
                 response["result"] = self._drain_passive_events()
             elif command_type == "set_device_parameter":
@@ -949,6 +981,181 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error deleting clip: " + str(e))
             raise
+
+    # ── listen: record the master or one track by resampling ─────────────
+    #
+    # The MCP server drives the flow (prepare -> record_start -> wait ->
+    # record_stop -> finish) and does the waiting; each command here is short
+    # and runs on Live's main thread. The LISTEN track is the only track these
+    # commands create or change; launch quantization is set to one bar for the
+    # recording and restored in listen_finish / listen_abort.
+
+    def _listen_track(self, track_index):
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if track.name != LISTEN_TRACK_NAME:
+            raise ValueError("Track %d is not the %s track" % (track_index, LISTEN_TRACK_NAME))
+        return track
+
+    def _listen_slot(self, track_index, slot_index):
+        track = self._listen_track(track_index)
+        if slot_index < 0 or slot_index >= len(track.clip_slots):
+            raise IndexError("Clip slot index out of range")
+        return track, track.clip_slots[slot_index]
+
+    @staticmethod
+    def _pick_routing(options, wanted_name=None, wanted_object=None):
+        """Pick a RoutingType/RoutingChannel by attached object, else by display name."""
+        options = list(options)
+        if wanted_object is not None:
+            for option in options:
+                if getattr(option, "attached_object", None) == wanted_object:
+                    return option
+        if wanted_name is not None:
+            for option in options:
+                if option.display_name == wanted_name:
+                    return option
+        return None
+
+    def _listen_prepare(self, source):
+        if not self._song.is_playing:
+            raise Exception("Transport is stopped - press play, then listen again")
+
+        tracks = list(self._song.tracks)
+        listen_index = None
+        for i, t in enumerate(tracks):
+            if t.name == LISTEN_TRACK_NAME:
+                listen_index = i
+                break
+        created = False
+        if listen_index is None:
+            self._song.create_audio_track(-1)
+            listen_index = len(self._song.tracks) - 1
+            self._song.tracks[listen_index].name = LISTEN_TRACK_NAME
+            created = True
+        track = self._song.tracks[listen_index]
+
+        if source == "master":
+            routing = self._pick_routing(track.available_input_routing_types, wanted_name="Resampling")
+            source_name = "master"
+            if routing is None:
+                raise Exception("No 'Resampling' input on the %s track" % LISTEN_TRACK_NAME)
+        else:
+            source_index = int(source)
+            if source_index < 0 or source_index >= len(self._song.tracks):
+                raise IndexError("Source track index out of range")
+            if source_index == listen_index:
+                raise ValueError("The %s track cannot listen to itself" % LISTEN_TRACK_NAME)
+            source_track = self._song.tracks[source_index]
+            source_name = source_track.name
+            routing = self._pick_routing(track.available_input_routing_types,
+                                         wanted_name=source_name, wanted_object=source_track)
+            if routing is None:
+                raise Exception("Track '%s' is not offered as an input of %s"
+                                % (source_name, LISTEN_TRACK_NAME))
+        track.input_routing_type = routing
+        channel_name = None
+        if source != "master":
+            channel = self._pick_routing(track.available_input_routing_channels, wanted_name="Post Mixer")
+            if channel is not None:
+                track.input_routing_channel = channel
+        channel_name = track.input_routing_channel.display_name
+
+        track.current_monitoring_state = MONITORING_OFF
+        track.arm = True
+
+        slot_index = None
+        for i, slot in enumerate(track.clip_slots):
+            if not slot.has_clip:
+                slot_index = i
+                break
+        if slot_index is None:
+            raise Exception("No free clip slot on the %s track" % LISTEN_TRACK_NAME)
+
+        previous_quantization = int(self._song.clip_trigger_quantization)
+        self._song.clip_trigger_quantization = QUANTIZATION_ONE_BAR
+
+        return {
+            "track_index": listen_index,
+            "slot_index": slot_index,
+            "created_track": created,
+            "source_name": source_name,
+            "input_routing": track.input_routing_type.display_name,
+            "input_channel": channel_name,
+            "tempo": self._song.tempo,
+            "signature_numerator": self._song.signature_numerator,
+            "signature_denominator": self._song.signature_denominator,
+            "previous_quantization": previous_quantization,
+        }
+
+    def _listen_record_start(self, track_index, slot_index):
+        track, slot = self._listen_slot(track_index, slot_index)
+        if slot.has_clip:
+            raise Exception("Clip slot is not empty")
+        if not track.arm:
+            raise Exception("%s track is not armed" % LISTEN_TRACK_NAME)
+        slot.fire()
+        return {"fired": True}
+
+    def _listen_status(self, track_index, slot_index):
+        track, slot = self._listen_slot(track_index, slot_index)
+        result = {
+            "song_time": self._song.current_song_time,
+            "is_playing": self._song.is_playing,
+            "has_clip": slot.has_clip,
+            "is_triggered": bool(getattr(slot, "is_triggered", False)),
+            "is_recording": False,
+        }
+        if slot.has_clip:
+            clip = slot.clip
+            result["is_recording"] = bool(clip.is_recording)
+            result["clip_length"] = clip.length
+        return result
+
+    def _listen_record_stop(self, track_index, slot_index):
+        track, slot = self._listen_slot(track_index, slot_index)
+        slot.stop()
+        return {"stopped": True}
+
+    def _listen_restore(self, track, previous_quantization):
+        track.arm = False
+        if previous_quantization is not None:
+            self._song.clip_trigger_quantization = int(previous_quantization)
+
+    def _listen_finish(self, track_index, slot_index, previous_quantization):
+        track, slot = self._listen_slot(track_index, slot_index)
+        if not slot.has_clip:
+            self._listen_restore(track, previous_quantization)
+            raise Exception("Nothing was recorded")
+        clip = slot.clip
+        if clip.is_recording:
+            raise Exception("Still recording")
+        result = {
+            "file_path": clip.file_path,
+            "clip_length": clip.length,
+            "sample_rate": getattr(clip, "sample_rate", None),
+        }
+        slot.delete_clip()
+        self._listen_restore(track, previous_quantization)
+        return result
+
+    def _listen_abort(self, track_index, slot_index, previous_quantization):
+        """Best-effort cleanup after a failed listen; never raises."""
+        done = []
+        try:
+            track, slot = self._listen_slot(track_index, slot_index)
+        except Exception:
+            return {"cleaned": done}
+        for name, action in (("stop", slot.stop),
+                             ("delete", lambda: slot.has_clip and slot.delete_clip()),
+                             ("restore", lambda: self._listen_restore(track, previous_quantization))):
+            try:
+                action()
+                done.append(name)
+            except Exception as e:
+                self.log_message("listen_abort %s failed: %s" % (name, e))
+        return {"cleaned": done}
 
 
     def _start_playback(self):

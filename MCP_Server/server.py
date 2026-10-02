@@ -139,7 +139,9 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator"
+            "create_locator",
+            "listen_prepare", "listen_record_start", "listen_record_stop",
+            "listen_finish", "listen_abort",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -995,6 +997,42 @@ def delete_clip(ctx: Context, track_index: int, clip_index: int, user_prompt: st
     except Exception as e:
         logger.error(f"Error deleting clip: {str(e)}")
         return f"Error deleting clip: {str(e)}"
+
+
+@mcp.tool()
+async def listen(ctx: Context, bars: int = 8, source: str = "master") -> str:
+    """
+    Record what Live plays right now - the master or one track - for a number of bars.
+
+    Needs a running transport (the tool never starts it). An audio track named LISTEN
+    is appended on first use (input Resampling, or the source track's output Post Mixer;
+    monitoring off) and armed only while recording. Launch quantization is one bar
+    during the recording, so it starts on a bar line and holds whole bars; the clip is
+    deleted afterwards and quantization restored. Returns JSON with file_path (the WAV
+    in the set's Samples/Recorded folder), tempo, signature, bars_recorded, start_bar,
+    source and set_name. Analyse the file with the sounddesign `sd listen` command.
+
+    Parameters:
+    - bars: Number of bars to record, 1-64 (default 8)
+    - source: "master" or the index of the track to listen to
+    """
+    import asyncio
+
+    from .listen import run_listen
+    from .script_handshake import get_cached_script_info, handshake, require_capability
+
+    try:
+        ableton = get_ableton_connection()
+        if get_cached_script_info() is None:  # Live started after the MCP server
+            handshake(ableton.send_command)
+        missing = require_capability("listen_prepare")
+        if missing:
+            return missing
+        result = await asyncio.to_thread(run_listen, ableton.send_command, bars, source)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error while listening: {str(e)}")
+        return f"Error while listening: {str(e)}"
 
 
 @mcp.tool()
