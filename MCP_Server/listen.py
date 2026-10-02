@@ -6,9 +6,10 @@ main-thread commands:
     listen_prepare -> listen_record_start -> (wait) -> listen_record_stop -> listen_finish
 
 Launch quantization is one bar while recording (set by listen_prepare), so the
-recording starts on a bar line; listen_record_stop is sent half a beat before
-the last bar ends and Live ends the recording on that bar line. The result is
-whole bars on a known grid.
+recording starts on a bar line; listen_record_stop is sent in the second half
+of the last bar - timed by Live's song position, not the wall clock, because a
+status round trip takes up to ~0.3 s - and Live ends the recording on the next
+bar line. The result is whole bars on a known grid.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from typing import Any, Callable, Dict, Union
 
 MAX_BARS = 64
 POLL_SECONDS = 0.02
-STOP_LEAD_BEATS = 0.5
+STOP_AT_BAR_FRACTION = 0.5  # send the stop this far into the last bar
 FILE_STABLE_SECONDS = 0.3
 
 SendCommand = Callable[[str, Dict[str, Any]], Dict[str, Any]]
@@ -112,12 +113,20 @@ def run_listen(
         started = _wait_for(
             send_command, ids, lambda s: s.get("is_recording"), 2 * bar_seconds + 2.0, "start", sleep, clock
         )
-        started_at = clock()
+        # Detection lags the real start by less than a bar, so the bar it falls in is the start bar.
         start_beat = math.floor(started["song_time"] / beats + 1e-6) * beats
-
-        stop_after = bars * bar_seconds - STOP_LEAD_BEATS * beat_seconds
-        while clock() - started_at < stop_after:
-            sleep(max(POLL_SECONDS, min(0.25, stop_after - (clock() - started_at))))
+        stop_beat = start_beat + (bars - 1 + STOP_AT_BAR_FRACTION) * beats
+        song_time = started["song_time"]
+        deadline = clock() + (stop_beat - song_time) * beat_seconds + 2 * bar_seconds + 2.0
+        while song_time < stop_beat:
+            if clock() > deadline:
+                raise ListenError("Song position stopped advancing while listening")
+            remaining = (stop_beat - song_time) * beat_seconds
+            sleep(max(POLL_SECONDS, min(1.0, remaining * 0.8)))
+            status = send_command("listen_status", ids)
+            if not status.get("is_playing", True):
+                raise ListenError("Transport stopped while listening")
+            song_time = status["song_time"]
         send_command("listen_record_stop", ids)
         _wait_for(
             send_command, ids, lambda s: s.get("has_clip") and not s.get("is_recording"),
@@ -134,7 +143,7 @@ def run_listen(
     file_path = finished["file_path"]
     size = _wait_file_stable(file_path, sleep)
     recorded_bars = float(finished["clip_length"]) / beats
-    return {
+    result = {
         "file_path": file_path,
         "file_bytes": size,
         "set_name": set_name_from_path(file_path),
@@ -149,3 +158,6 @@ def run_listen(
         "created_track": bool(prep.get("created_track")),
         "track_index": ids["track_index"],
     }
+    if abs(recorded_bars - bars) > 0.01:
+        result["warning"] = f"recorded {recorded_bars:g} bars instead of {bars} - use bars_recorded"
+    return result

@@ -30,6 +30,7 @@ class FakeLive:
         self.deleted = False
         self.wav = tmp_path / "Samples" / "Recorded" / "LISTEN 0001.wav"
         self.fail_on = None
+        self.status_lag_s = 0.0  # each status round trip costs this much time
 
     # clock
     def sleep(self, s):
@@ -75,6 +76,8 @@ class FakeLive:
             self.record_start_beat = self._next_bar(self.beat)
             return {"fired": True}
         if command == "listen_status":
+            self.now += self.status_lag_s
+            self._update()
             started = self.record_start_beat is not None and self.beat >= self.record_start_beat
             recording = started and self.record_end_beat is None
             return {"song_time": self.beat, "is_playing": True,
@@ -118,6 +121,14 @@ def test_stop_is_sent_inside_the_last_bar(tmp_path):
     _run(live, bars=2)
     last_bar_start = live.record_start_beat + live.bar_beats
     assert last_bar_start < live.stop_requested_beat < live.record_start_beat + 2 * live.bar_beats
+
+
+def test_slow_status_round_trips_still_give_exact_bars(tmp_path):
+    for bars in (1, 2, 8):
+        live = FakeLive(tmp_path, tempo=98.5, song_time=68.2 + bars)
+        live.status_lag_s = 0.3  # measured in Live 10.1 on 2026-10-02
+        result = _run(live, bars=bars)
+        assert result["bars_recorded"] == bars and "warning" not in result
 
 
 def test_stopped_transport_is_reported(tmp_path):
