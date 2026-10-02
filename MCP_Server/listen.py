@@ -23,6 +23,9 @@ MAX_BARS = 64
 POLL_SECONDS = 0.02
 STOP_AT_BAR_FRACTION = 0.5  # send the stop this far into the last bar
 FILE_STABLE_SECONDS = 0.3
+PREPARE_ATTEMPTS = 4
+PREPARE_RETRY_SECONDS = 0.3
+BUSY_MESSAGE = "Changes cannot be triggered by notifications"
 
 SendCommand = Callable[[str, Dict[str, Any]], Dict[str, Any]]
 
@@ -71,6 +74,22 @@ def _wait_file_stable(path: str, sleep: Callable[[float], None], timeout: float 
     raise ListenError(f"Recorded file did not appear or kept changing: {path}")
 
 
+def _prepare(send_command: SendCommand, source: Union[str, int], sleep: Callable[[float], None]) -> Dict[str, Any]:
+    """listen_prepare, repeated while Live is busy or the LISTEN track was only just created."""
+    for _ in range(PREPARE_ATTEMPTS):
+        try:
+            prep = send_command("listen_prepare", {"source": source})
+        except Exception as e:
+            if BUSY_MESSAGE not in str(e):
+                raise
+            sleep(PREPARE_RETRY_SECONDS)
+            continue
+        if not prep.get("pending"):
+            return prep
+        sleep(PREPARE_RETRY_SECONDS)
+    raise ListenError("Live stayed busy - could not set up the LISTEN track; try again")
+
+
 def set_name_from_path(file_path: str) -> str:
     """Live writes recordings to <Live project>/Samples/Recorded/<file>.wav."""
     parts = os.path.normpath(file_path).split(os.sep)
@@ -98,7 +117,7 @@ def run_listen(
         except (TypeError, ValueError):
             raise ListenError('source must be "master" or a track index') from None
 
-    prep = send_command("listen_prepare", {"source": source})
+    prep = _prepare(send_command, source, sleep)
     ids = {"track_index": prep["track_index"], "slot_index": prep["slot_index"]}
     restore = {**ids, "previous_quantization": prep.get("previous_quantization")}
     numerator = int(prep["signature_numerator"])
@@ -158,6 +177,13 @@ def run_listen(
         "created_track": bool(prep.get("created_track")),
         "track_index": ids["track_index"],
     }
+    warnings = []
     if abs(recorded_bars - bars) > 0.01:
-        result["warning"] = f"recorded {recorded_bars:g} bars instead of {bars} - use bars_recorded"
+        warnings.append(f"recorded {recorded_bars:g} bars instead of {bars} - use bars_recorded")
+    if prep.get("soloed"):
+        warnings.append(
+            "soloed: " + ", ".join(prep["soloed"]) + " - everything else was silent in this recording"
+        )
+    if warnings:
+        result["warning"] = "; ".join(warnings)
     return result

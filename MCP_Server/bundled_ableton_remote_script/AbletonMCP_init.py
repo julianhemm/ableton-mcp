@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1-jh.1"
+SCRIPT_VERSION = "1.7.1-jh.2"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -1023,18 +1023,29 @@ class AbletonMCP(ControlSurface):
             raise Exception("Transport is stopped - press play, then listen again")
 
         tracks = list(self._song.tracks)
+        pending = getattr(self, "_listen_pending_track", None)
         listen_index = None
         for i, t in enumerate(tracks):
             if t.name == LISTEN_TRACK_NAME:
                 listen_index = i
                 break
         created = False
+        if listen_index is None and pending is not None:
+            for i, t in enumerate(tracks):
+                if t == pending:
+                    listen_index = i
+                    created = True
+                    break
         if listen_index is None:
+            # Live refuses further changes in the tick that created a track ("Changes cannot be triggered by
+            # notifications"), so the new track is set up by the next listen_prepare call.
             self._song.create_audio_track(-1)
-            listen_index = len(self._song.tracks) - 1
-            self._song.tracks[listen_index].name = LISTEN_TRACK_NAME
-            created = True
+            self._listen_pending_track = self._song.tracks[len(self._song.tracks) - 1]
+            return {"pending": True}
+        self._listen_pending_track = None
         track = self._song.tracks[listen_index]
+        if track.name != LISTEN_TRACK_NAME:
+            track.name = LISTEN_TRACK_NAME
 
         if source == "master":
             routing = self._pick_routing(track.available_input_routing_types, wanted_name="Resampling")
@@ -1073,6 +1084,8 @@ class AbletonMCP(ControlSurface):
         if slot_index is None:
             raise Exception("No free clip slot on the %s track" % LISTEN_TRACK_NAME)
 
+        soloed = [t.name for t in self._song.tracks if getattr(t, "solo", False) and t != track]
+
         previous_quantization = int(self._song.clip_trigger_quantization)
         self._song.clip_trigger_quantization = QUANTIZATION_ONE_BAR
 
@@ -1087,6 +1100,7 @@ class AbletonMCP(ControlSurface):
             "signature_numerator": self._song.signature_numerator,
             "signature_denominator": self._song.signature_denominator,
             "previous_quantization": previous_quantization,
+            "soloed": soloed,
         }
 
     def _listen_record_start(self, track_index, slot_index):

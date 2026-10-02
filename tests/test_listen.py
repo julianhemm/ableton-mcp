@@ -31,6 +31,8 @@ class FakeLive:
         self.wav = tmp_path / "Samples" / "Recorded" / "LISTEN 0001.wav"
         self.fail_on = None
         self.status_lag_s = 0.0  # each status round trip costs this much time
+        self.prepare_script = []  # per listen_prepare call: "busy" or "pending" before the real answer
+        self.soloed = []
 
     # clock
     def sleep(self, s):
@@ -64,6 +66,11 @@ class FakeLive:
             raise Exception("boom")
         self._update()
         if command == "listen_prepare":
+            if self.prepare_script:
+                step = self.prepare_script.pop(0)
+                if step == "busy":
+                    raise Exception("Changes cannot be triggered by notifications. You will need to defer.")
+                return {"pending": True}
             if not self.playing:
                 raise Exception("Transport is stopped - press play, then listen again")
             return {
@@ -71,6 +78,7 @@ class FakeLive:
                 "source_name": "master", "input_routing": "Resampling", "input_channel": "",
                 "tempo": self.tempo, "signature_numerator": self.num,
                 "signature_denominator": self.den, "previous_quantization": 7,
+                "soloed": self.soloed,
             }
         if command == "listen_record_start":
             self.record_start_beat = self._next_bar(self.beat)
@@ -129,6 +137,28 @@ def test_slow_status_round_trips_still_give_exact_bars(tmp_path):
         live.status_lag_s = 0.3  # measured in Live 10.1 on 2026-10-02
         result = _run(live, bars=bars)
         assert result["bars_recorded"] == bars and "warning" not in result
+
+
+def test_prepare_waits_for_a_new_track_and_a_busy_live(tmp_path):
+    live = FakeLive(tmp_path)
+    live.prepare_script = ["pending", "busy"]
+    result = _run(live, bars=1)
+    assert result["bars_recorded"] == 1
+    assert live.calls[:3] == ["listen_prepare"] * 3
+
+
+def test_prepare_gives_up_when_live_stays_busy(tmp_path):
+    live = FakeLive(tmp_path)
+    live.prepare_script = ["busy"] * 10
+    with pytest.raises(ListenError, match="busy"):
+        _run(live, bars=1)
+    assert "listen_record_start" not in live.calls
+
+
+def test_soloed_tracks_are_reported(tmp_path):
+    live = FakeLive(tmp_path)
+    live.soloed = ["CAL Kick"]
+    assert "soloed: CAL Kick" in _run(live, bars=1)["warning"]
 
 
 def test_stopped_transport_is_reported(tmp_path):
@@ -198,6 +228,7 @@ class Slot:
 class Track:
     def __init__(self, name, song):
         self.name = name
+        self.solo = False
         self.arm = False
         self.current_monitoring_state = 1
         self.clip_slots = [Slot() for _ in range(4)]
@@ -246,8 +277,11 @@ def test_prepare_appends_listen_track_on_resampling(script_module):
     song = Song(["1 PEAK", "2 RYTM"])
     song.tracks[0].arm = True
     inst = _instance(script_module, song)
+    assert inst._listen_prepare("master") == {"pending": True}  # Live: no changes in the creating tick
+    assert len(song.tracks) == 3
     r = inst._listen_prepare("master")
     listen = song.tracks[2]
+    assert len(song.tracks) == 3
     assert listen.name == "LISTEN" and r["track_index"] == 2 and r["created_track"]
     assert listen.input_routing_type.display_name == "Resampling"
     assert listen.arm and listen.current_monitoring_state == 2
@@ -263,6 +297,12 @@ def test_prepare_reuses_listen_track_and_routes_a_source_track_post_mixer(script
     assert len(song.tracks) == 3 and not r["created_track"]
     assert song.tracks[2].input_routing_type.attached_object is song.tracks[1]
     assert r["source_name"] == "2 RYTM" and r["input_channel"] == "Post Mixer"
+
+
+def test_prepare_lists_soloed_tracks(script_module):
+    song = Song(["1 PEAK", "CAL Kick", "LISTEN"])
+    song.tracks[1].solo = True
+    assert _instance(script_module, song)._listen_prepare(0)["soloed"] == ["CAL Kick"]
 
 
 def test_prepare_refuses_stopped_transport_and_self_listening(script_module):

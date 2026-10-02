@@ -9,6 +9,7 @@ Fork version `1.4.5+jh.N`, Remote Script version `1.7.1-jh.N` (must equal `EXPEC
 | Version | Change |
 |---|---|
 | `1.4.5+jh.1` / script `1.7.1-jh.1` | tool `listen(bars, source)` with Remote Script commands `listen_*` (2026-10-02) |
+| `1.4.5+jh.1` / script `1.7.1-jh.2` | `listen`: new LISTEN track set up on the next prepare call (Live refuses changes in the creating tick), busy retries, soloed tracks reported (2026-10-02) |
 
 ## Layout
 
