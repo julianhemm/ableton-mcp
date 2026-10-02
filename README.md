@@ -1,3 +1,7 @@
+> **Fork note (julianhemm/ableton-mcp, `1.4.5+jh.N`):** adds the `listen` tool - record N bars of the master
+> or one track by resampling inside Live and return the WAV for analysis. Tested with Live 10.1.43. Developer notes,
+> deploy steps and the list of fork changes: [CLAUDE.md](CLAUDE.md). Everything below is the upstream README.
+
 <div align="center">
 
 # Ableton MCP

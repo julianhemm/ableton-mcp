@@ -4,6 +4,12 @@ Fork of ableton-mcp 1.4.5 for the sounddesign knowledge base (`D:\dev\sounddesig
 Fork version `1.4.5+jh.N`, Remote Script version `1.7.1-jh.N` (must equal `EXPECTED_REMOTE_SCRIPT_VERSION` in
 `MCP_Server/remote_script_install.py`).
 
+## Fork changes
+
+| Version | Change |
+|---|---|
+| `1.4.5+jh.1` / script `1.7.1-jh.1` | tool `listen(bars, source)` with Remote Script commands `listen_*` (2026-10-02) |
+
 ## Layout
 
 - `AbletonMCP_Remote_Script/__init__.py` - runs inside Live 10.1 on **Python 2**: no f-strings, no type hints.
